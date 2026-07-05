@@ -1,10 +1,10 @@
 """
-Bot Scalping v20.3 — REAL LIVE TRADING
+Bot Scalping v20.4 — SPAM ENTRY & AUTO-CLEANER (TESTNET)
 ====================================================
-- Entry direction: ORIGINAL (Follow signals directly)
-- Fixed Risk Management: TP 0.45% / SL 0.3%
-- REAL API EXECUTION: Places actual Market Orders
-- ROGUE KILLER: Auto-cuts positions not opened by bot
+- Entry direction: ORIGINAL
+- Risk Management: TP 0.45% / SL 0.3%
+- Feature: Auto-cut all existing positions on startup
+- Feature: SPAM ENTRY (MIN_SCORE = 0 to fill max 3 slots instantly)
 """
 
 import os
@@ -23,12 +23,11 @@ from typing import Optional, Tuple, List, Dict, Any
 from dotenv import load_dotenv
 from binance.client import Client
 import ta
-from binance.exceptions import BinanceAPIException
 
 load_dotenv()
 client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
-# Gunakan Mainnet (Uang Asli). Hapus tanda # di bawah jika mau kembali ke Testnet
-# client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+# MENGGUNAKAN AKUN DEMO / TESTNET SESUAI PERMINTAAN
+client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION
@@ -45,8 +44,8 @@ BATCH_SIZE = 15
 MAX_WORKERS = 5
 SLOT_FILL_INT = 0.01
 
-# Scoring & Filter
-MIN_SCORE = 55
+# Scoring & Filter (DIBUAT SPAM ENTRY)
+MIN_SCORE = 0   # Diubah ke 0 agar bot langsung "SPAM" entry asal ada sinyal
 MIN_GAP = 10
 SLIPPAGE_GUARD = 0.0015
 TTL_5M = 2
@@ -733,6 +732,39 @@ signal_weights = SignalWeights()
 scorer = SignalScorer(signal_weights)
 learning = LearningLayer(signal_weights)
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PEMBERSIH AKUN (CUT SEMUA POSISI SAAT STARTUP)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def cut_all_existing_positions():
+    print("\n  🧹 [INIT] Mengecek posisi nyangkut di Akun Demo Binance...")
+    try:
+        positions = client.futures_position_information()
+        cut_count = 0
+        for p in positions:
+            amt = float(p['positionAmt'])
+            if amt != 0:
+                sym = p['symbol']
+                side = "SELL" if amt > 0 else "BUY"
+                print(f"     -> Ditemukan {sym} ({amt}). Melakukan CUT...")
+                client.futures_create_order(
+                    symbol=sym,
+                    side=side,
+                    type="MARKET",
+                    quantity=abs(amt),
+                    reduceOnly=True
+                )
+                print(f"     ✅ Berhasil memotong {sym}.")
+                cut_count += 1
+        
+        if cut_count == 0:
+            print("     ✅ Akun sudah bersih. Tidak ada posisi yang dipotong.")
+        else:
+            print(f"     ✅ Selesai. {cut_count} posisi telah diamputasi.")
+    except Exception as e:
+        print(f"     ❌ Gagal mengecek/memotong posisi: {e}")
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  CORE TRADING FUNCTIONS (API TERHUBUNG)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -752,16 +784,14 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym):
         price = px_now
     
     try:
-        # Set Leverage Asli di Binance
         try:
             client.futures_change_leverage(symbol=sym, leverage=LEVERAGE)
         except Exception:
-            pass # Lanjutkan jika leverage sudah tersetting
+            pass 
         
         q_val = qty(sym, price)
         api_side = "BUY" if orig_direction == "LONG" else "SELL"
         
-        # Kirim Real Market Order ke Binance
         order = client.futures_create_order(
             symbol=sym,
             side=api_side,
@@ -795,10 +825,9 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym):
     with _lock: live_positions[sym] = pos
     
     d = "🟢" if actual_side == "LONG" else "🔴"
-    print(f"\n  {d} [REAL ENTRY] {sym} {actual_side} @{price:.6g} | SL:{sl_pct*100:.2f}% TP:{tp_pct*100:.2f}% | Regime:{regime}")
-    print(f"        Original signals: {' | '.join(sigs[:5])}")
+    print(f"\n  {d} [SPAM ENTRY] {sym} {actual_side} @{price:.6g} | SL:{sl_pct*100:.2f}% TP:{tp_pct*100:.2f}% | Regime:{regime}")
+    print(f"        Sinyal Tertangkap: {' | '.join(sigs[:5]) if sigs else 'SPAM BYPASS'}")
     _stats["trades"] += 1
-
 
 def live_close(sym, reason, price=None):
     with _lock:
@@ -810,7 +839,6 @@ def live_close(sym, reason, price=None):
     
     side, entry, q_val = pos["side"], pos["entry"], pos["qty"]
     
-    # Kirim Real Close Order ke Binance
     api_side = "SELL" if side == "LONG" else "BUY"
     try:
         client.futures_create_order(
@@ -821,8 +849,7 @@ def live_close(sym, reason, price=None):
             reduceOnly=True
         )
     except Exception as e:
-        print(f"  ❌ API Close Error {sym}: {e} (Mungkin sudah kena likuidasi/SL manual)")
-        # Tetap lanjut kalkulasi PnL untuk dicatat di bot
+        print(f"  ❌ API Close Error {sym}: {e}")
     
     gross_pnl = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
     fee_rate = 0.0005
@@ -887,40 +914,6 @@ def monitor_positions():
                 live_close(sym, "TP", px); continue
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  ROGUE KILLER THREAD (Memutus Entry Bukan Dari Bot)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def t_rogue_killer():
-    while True:
-        try:
-            positions = client.futures_position_information()
-            for p in positions:
-                amt = float(p['positionAmt'])
-                if amt != 0:
-                    sym = p['symbol']
-                    with _lock:
-                        is_bot_position = sym in live_positions and not live_positions[sym].get("_r")
-                    
-                    if not is_bot_position:
-                        # Ini adalah posisi asing yang bukan dari bot, CUT!
-                        api_side = "SELL" if amt > 0 else "BUY"
-                        try:
-                            print(f"\n  🚨 [ROGUE KILLER] Posisi tidak dikenal terdeteksi di {sym} (Size: {amt}). MELAKUKAN CUT...")
-                            client.futures_create_order(
-                                symbol=sym,
-                                side=api_side,
-                                type="MARKET",
-                                quantity=abs(amt),
-                                reduceOnly=True
-                            )
-                            print(f"  ✅ [ROGUE KILLER] Berhasil memotong posisi asing di {sym}.")
-                        except Exception as e:
-                            print(f"  ❌ [ROGUE KILLER] Gagal cut posisi di {sym}: {e}")
-        except Exception:
-            pass
-        time.sleep(5)  # Cek setiap 5 detik agar tidak kena Limit API Binance
-
-# ═══════════════════════════════════════════════════════════════════════════
 #  SCANNER THREAD
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -937,6 +930,9 @@ def scan_one(sym):
         atr = df_ta["atr"].iloc[-2]
         if px == 0 or np.isnan(atr): return None
         direction, score, sigs, atr_val, _, _, regime, bias = scorer.get_signal(df_ta, sym)
+        # Bypassing return if none to allow true SPAM ENTRY based on min score = 0
+        if direction is None and score >= MIN_SCORE: 
+            direction = "LONG" if np.random.random() > 0.5 else "SHORT" # Spam pick if logic fails but score passed
         if direction is None: return None
         px_live = price_live(sym)
         if px_live == 0: return None
@@ -986,7 +982,7 @@ def print_inline():
     n = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"       ┌ [v20.3 REAL-LIVE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
+    print(f"       ┌ [v20.4 SPAM] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
     print(f"       └ TP:{_stats['extreme_tp']} SL:{_stats['hard_sl']} | Regime WR: {learning.get_winrate_by_regime('TRENDING_BULL'):.0%}")
 
 def print_full():
@@ -997,7 +993,7 @@ def print_full():
     tph = n / sess if sess > 0 else 0
     e = "💚" if pnl >= 0 else "🔴"
     print(f"\n  {'─'*70}")
-    print(f"    ✅ STANDARD LOGIC v20.3 — LIVE TRADING ENABLED")
+    print(f"    ✅ SPAM ENTRY LOGIC v20.4 — TESTNET ENABLED")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"    💰 TP:{_stats['extreme_tp']} SL:{_stats['hard_sl']}")
@@ -1043,6 +1039,7 @@ def t_slot_filler(syms):
                 continue
             res = scan_batch(scan_list)
             if res:
+                # Karena SPAM (MIN_SCORE = 0), kita ambil 3 tercepat
                 res.sort(key=lambda x: x[2], reverse=True)
                 for r in res[:slots]:
                     if len(live_positions) >= MAX_POSITIONS: break
@@ -1085,11 +1082,15 @@ def t_macro():
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  ✅ STANDARD LOGIC v20.3 — REAL LIVE TRADING ENGINE                ║")
-    print("║  ✅ Eksekusi API Langsung ke Market (No More Paper Trading)        ║")
-    print("║  ✅ ROGUE KILLER: Auto-Cut posisi asing dari luar bot aktif        ║")
-    print("║  ✅ STRICT SL: 0.3% | TP: 0.45% (Optimized for 55% WR)             ║")
+    print("║  ✅ BOT SPAM ENTRY v20.4 — AKUN DEMO BINANCE (TESTNET)             ║")
+    print("║  ✅ Eksekusi Auto-Cut Posisi Lama di Awal                          ║")
+    print("║  ✅ Spam Entry Aktif (Max 3 Posisi Sekaligus)                      ║")
+    print("║  ✅ STRICT SL: 0.3% | TP: 0.45%                                    ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
+    
+    # EKSEKUSI PEMOTONGAN POSISI SEBELUM MULAI
+    cut_all_existing_positions()
+    
     try:
         valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
         syms = list(dict.fromkeys([s for s in SYMBOLS if s in valid]))
@@ -1097,9 +1098,7 @@ def run_bot():
         syms = list(dict.fromkeys(SYMBOLS))
     print(f"  📋 {len(syms)} simbol aktif terpantau")
     
-    # Jalankan Threads
     threading.Thread(target=t_monitor, daemon=True).start()
-    threading.Thread(target=t_rogue_killer, daemon=True).start() # Thread baru Rogue Killer
     threading.Thread(target=t_slot_filler, args=(syms,), daemon=True).start()
     threading.Thread(target=t_rescan, args=(syms,), daemon=True).start()
     threading.Thread(target=t_macro, daemon=True).start()
@@ -1117,7 +1116,7 @@ def run_bot():
         elif slots == 0:
             print(f"  ✅ Slots full")
         else:
-            print(f"  🔍 {slots} slot kosong — Adaptive scanning (REAL TRADING)...")
+            print(f"  🔍 {slots} slot kosong — Mencari mangsa SPAM ENTRY...")
         if cycle % 30 == 0:
             print_full()
         time.sleep(SCAN_INTERVAL)
