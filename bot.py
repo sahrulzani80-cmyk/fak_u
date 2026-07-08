@@ -1,28 +1,30 @@
 """
-Bot Scalping v20.6 — TRAIL GAP TUNED
+Bot Scalping v20.8 — PEAK PnL PROTECTION
 ====================================================
-Perubahan dari v20.5:
+Data aktual v20.7 (390T):
+  Breakdown PnL: EmgTP +19.0U | Trail +26.5U | SL -29.4U = +16.1U net
+  EmgTP (25x) menyumbang +19U dari +16U total → big wins sangat krusial
 
-1. TRAIL_GAP_PCT  0.20% → 0.15%
-   Alasan matematis dari data aktual v20.5 (92T, WR=50%):
-     Avg peak(wins) = 0.653%  |  Dibutuhkan = 0.692%  |  Kurang = 0.038%
-   Dengan gap 0.15%: dibutuhkan turun ke 0.642% → margin positif +0.011%
-   EV per trade: -0.00780U (sekarang) → +0.00220U (target)
-   Simulasi 200 trade: -1.56U → +0.44U
+  Semua regime PROFITABLE:
+    EXHAUSTION    : EV +0.005U/T  (209T, WR 49%)
+    TRENDING_BEAR : EV +0.024U/T  (82T,  WR 44%)
+    TRENDING_BULL : EV +0.133U/T  (99T,  WR 68%)
 
-   Risiko: gap lebih ketat = trail lebih sering kena candle noise.
-   Tapi defisit hanya 0.038% → perubahan minimum yang cukup.
+  Root cause +22U → +16U drawdown:
+    P(SL) = 47.2% → streak 10-15x SL beruntun = -1.6 sampai -6U
+    Ini kejadian NORMAL secara statistik — bukan sinyal rusak
+    Terjadi ketika SL streak + tidak ada EmgTP besar secara bersamaan
 
-2. Tampilan per-regime di print_full
-   Supaya kelihatan regime mana yang perform (WR + avg_peak per regime).
-   Fokus data di TRENDING_BULL, TRENDING_BEAR, EXHAUSTION
-   (RANGE+VOLATILE sudah diblokir sejak v20.5).
+FIX v20.8 — Peak PnL Protection (Trailing Stop pada Ekuitas):
+  Track PnL tertinggi yang dicapai session → jika PnL turun PEAK_DRAWDOWN_LIMIT
+  dari peak tersebut → pause trading PEAK_DRAWDOWN_PAUSE detik.
 
-Unchanged dari v20.5:
-  - TRAIL_ACTIVATE_PCT = 0.30% (sama dengan SL)
-  - SL_PCT             = 0.30%
-  - RANGE + VOLATILE regime diblokir
-  - Semua signal logic, regime detection, exhaustion filter
+  Contoh: peak +22U, PEAK_DRAWDOWN_LIMIT = 3.0U
+    → KS aktif di +19U → mencegah jatuh ke +16U
+    → Resume 30 menit kemudian (kondisi market mungkin sudah berubah)
+
+  Unchanged: SEMUA sinyal, threshold, regime filter dari v20.7.
+  Satu-satunya perubahan: equity trailing stop.
 """
 
 import os
@@ -61,7 +63,10 @@ MAX_WORKERS   = 5
 SLOT_FILL_INT = 0.01
 
 # Scoring & Filter
-MIN_SCORE      = 55
+MIN_SCORE             = 55   # threshold untuk TRENDING regime
+MIN_SCORE_EXHAUSTION  = 65   # threshold lebih tinggi untuk EXHAUSTION
+                              # v20.7: 55→65 karena EXHAUSTION WR=58% vs BEP=58.1%
+                              # Sinyal score 55-64 di EXHAUSTION terlalu banyak false positive
 SLIPPAGE_GUARD = 0.0015
 TTL_5M         = 2
 
@@ -78,6 +83,12 @@ EMERGENCY_TP_PCT   = 0.020   # 2.0%  safety net (posisi tidak terbuka selamanya)
 DAILY_LOSS  = -20.0
 CONSEC_MAX  = 15
 CONSEC_PAUSE = 10
+
+# Peak PnL Protection (v20.8) — Trailing Stop pada Ekuitas
+# Jika PnL turun PEAK_DRAWDOWN_LIMIT dari nilai tertinggi session → pause trading
+# Mencegah drawdown masif saat SL streak terjadi tanpa EmgTP besar
+PEAK_DRAWDOWN_LIMIT = 3.0    # pause jika turun 3U dari peak PnL
+PEAK_DRAWDOWN_PAUSE = 1800   # pause selama 30 menit (reset kondisi market)
 
 # Learning
 LEARNING_WINDOW       = 200
@@ -349,10 +360,11 @@ class SignalScorer:
             return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
 
         elif regime == MarketRegime.REGIME_EXHAUSTION:
-            # EXHAUSTION tetap diizinkan: syarat ketat (3+ konfirmasi exhaustion)
-            if short_score > long_score and short_score >= MIN_SCORE and ec_short >= 2:
+            # v20.7: MIN_SCORE_EXHAUSTION=65 (naik dari 55) + ec >= 3 (naik dari 2)
+            # Data v20.6: EXHAUSTION WR=58% vs BEP=58.1% → filter sinyal lemah
+            if short_score > long_score and short_score >= MIN_SCORE_EXHAUSTION and ec_short >= 3:
                 return "SHORT", short_score, short_sigs + er_short, atr, 0, 0, regime, bias
-            if long_score > short_score and long_score >= MIN_SCORE and ec_long >= 2:
+            if long_score > short_score and long_score >= MIN_SCORE_EXHAUSTION and ec_long >= 3:
                 return "LONG", long_score, long_sigs + er_long, atr, 0, 0, regime, bias
             return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
 
@@ -548,11 +560,14 @@ _rescan_q        = queue.Queue()
 _hot_syms        = deque(maxlen=30)
 
 _macro = {"btc": "UNKNOWN"}
-_ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
+_ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0,
+          "peak_dd_active": False}  # flag khusus peak drawdown supaya bisa reset sendiri
 _stats = {
     "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0,
     "trail_exit": 0, "hard_sl": 0, "emg_tp": 0,
-    "regime_block": 0,  # jumlah sinyal yang diblokir karena RANGE/VOLATILE
+    "regime_block": 0,
+    "peak_pnl": 0.0,          # PnL tertinggi yang pernah dicapai session ini
+    "peak_dd_count": 0,       # berapa kali peak drawdown KS aktif
     "hist": deque(maxlen=200), "start": time.time(),
 }
 
@@ -626,8 +641,11 @@ def ohlcv(symbol, interval, limit=100):
 def ks_check():
     k, now = _ks, time.time()
     if k["active"] and now >= k["resume"]:
-        k["active"] = False; k["consec"] = 0
+        k["active"] = False
+        k["consec"] = 0
+        k["peak_dd_active"] = False
     if k["active"]: return True, k["reason"]
+
     day = now - (now % 86400)
     if day > k["day_reset"]: k["daily"] = 0.0; k["day_reset"] = day
     if k["daily"] <= DAILY_LOSS:
@@ -636,11 +654,32 @@ def ks_check():
     if k["consec"] >= CONSEC_MAX:
         k["active"] = True; k["reason"] = f"consec({k['consec']})"
         k["resume"] = now + CONSEC_PAUSE; return True, k["reason"]
+
+    # ── Peak PnL Protection (v20.8) ──────────────────────────────────────
+    # Hanya aktif jika pernah capai profit signifikan (>= 1U dari peak)
+    # supaya tidak langsung aktif di awal session saat peak masih 0
+    cur_pnl  = _stats["pnl"]
+    peak_pnl = _stats["peak_pnl"]
+    drawdown = peak_pnl - cur_pnl
+    if peak_pnl >= 1.0 and drawdown >= PEAK_DRAWDOWN_LIMIT and not k["peak_dd_active"]:
+        k["active"]        = True
+        k["peak_dd_active"] = True
+        k["reason"]        = f"peak_dd({peak_pnl:.2f}→{cur_pnl:.2f}, -{drawdown:.2f}U)"
+        k["resume"]        = now + PEAK_DRAWDOWN_PAUSE
+        _stats["peak_dd_count"] += 1
+        print(f"\n  🛑 [PEAK DD] PnL turun {drawdown:.2f}U dari peak {peak_pnl:.2f}U"
+              f" → pause {PEAK_DRAWDOWN_PAUSE//60} menit")
+        return True, k["reason"]
+    # ─────────────────────────────────────────────────────────────────────
+
     return False, ""
 
 def ks_upd(pnl):
     _ks["daily"] += pnl
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
+    # Update peak PnL untuk drawdown protection
+    if _stats["pnl"] > _stats["peak_pnl"]:
+        _stats["peak_pnl"] = _stats["pnl"]
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  TRADING STATE
@@ -908,8 +947,73 @@ def print_inline():
     margin_pct  = (avg_pk - needed_peak) * 100
     margin_icon = "✅" if margin_pct >= 0 else "❌"
     e   = "💚" if pnl >= 0 else "🔴"
-    print(f"       ┌ [v20.6] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
-    print(f"       └ Trail:{_stats['trail_exit']} SL:{_stats['hard_sl']} AvgWin:{aw:+.4f}U | Peak:{avg_pk*100:.3f}% {margin_icon}{margin_pct:+.3f}%")
+    # Peak PnL & drawdown
+    peak = _stats["peak_pnl"]
+    dd   = peak - pnl
+    dd_str = f" | Peak:{peak:+.2f}U DD:{dd:.2f}U/{PEAK_DRAWDOWN_LIMIT:.0f}U" if peak > 0 else ""
+    print(f"       ┌ [v20.8] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U{dd_str}")
+    print(f"       └ Trail:{_stats['trail_exit']} SL:{_stats['hard_sl']} EmgTP:{_stats['emg_tp']} AvgWin:{aw:+.4f}U | Peak:{avg_pk*100:.3f}% {margin_icon}{margin_pct:+.3f}%")
+
+def print_full():
+    n    = _stats["wins"] + _stats["losses"]
+    wr   = _stats["wins"] / n * 100 if n else 0
+    pnl  = _stats["pnl"]
+    sess = (time.time() - _stats["start"]) / 3600
+    tph  = n / sess if sess > 0 else 0
+    e    = "💚" if pnl >= 0 else "🔴"
+    aw   = learning.avg_win()
+    al   = learning.avg_loss()
+    bep  = al / (al + aw) * 100 if (al + aw) > 0 else 50
+
+    notional     = ORDER_USDT * LEVERAGE
+    fee_rt       = notional * 0.001
+    needed_aw    = (1 - wr/100) * al / (wr/100) if wr > 0 else 0
+    needed_peak  = (needed_aw + fee_rt) / notional + TRAIL_GAP_PCT if wr > 0 else 0
+    avg_pk_win   = learning.avg_peak_win()
+    peak_gap     = avg_pk_win - needed_peak
+    peak_status  = f"✅ MARGIN +{peak_gap*100:.3f}%" if peak_gap >= 0 else f"❌ KURANG {abs(peak_gap)*100:.3f}%"
+
+    # Peak PnL drawdown info
+    peak_pnl     = _stats["peak_pnl"]
+    cur_drawdown = peak_pnl - pnl
+    dd_pct       = cur_drawdown / peak_pnl * 100 if peak_pnl > 0 else 0
+    dd_status    = f"🛑 AKTIF" if _ks.get("peak_dd_active") else f"{cur_drawdown:.2f}U/{PEAK_DRAWDOWN_LIMIT:.0f}U ({dd_pct:.1f}%)"
+
+    print(f"\n  {'─'*70}")
+    print(f"    🔔 TRAIL v20.8 — PEAK PnL PROTECTION")
+    print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
+    print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
+    print(f"    🏔️  Peak PnL:{peak_pnl:+.5f}U | Drawdown:{dd_status}")
+    print(f"    🛡️  Peak DD KS: aktif {_stats['peak_dd_count']}x (limit -{PEAK_DRAWDOWN_LIMIT:.0f}U, pause {PEAK_DRAWDOWN_PAUSE//60}min)")
+    print(f"    📈 Exit: Trail:{_stats['trail_exit']} | SL:{_stats['hard_sl']} | EmgTP:{_stats['emg_tp']}")
+    print(f"    🚫 Regime diblokir: {_stats['regime_block']} scan (RANGE+VOLATILE)")
+    print(f"    💰 Avg Win:{aw:+.5f}U | Avg Loss:{-al:+.5f}U | BEP WR:{bep:.1f}%")
+    print(f"    📊 Global WR:{learning.get_global_winrate():.1%}")
+    print(f"    ⚙️  SL:{SL_PCT*100:.2f}% | Trail@{TRAIL_ACTIVATE_PCT*100:.2f}% gap:{TRAIL_GAP_PCT*100:.2f}% | MinScore TREND:{MIN_SCORE} EXHAUST:{MIN_SCORE_EXHAUSTION}")
+    print(f"    📏 Avg Peak(wins):{avg_pk_win*100:.3f}% | Butuh:{needed_peak*100:.3f}% | {peak_status}")
+
+    # Per-regime breakdown
+    regime_stats = learning.stats_by_regime
+    if regime_stats:
+        print(f"    {'─'*60}")
+        print(f"    {'Regime':<22} {'W':>4} {'L':>4} {'WR':>6} {'PnL':>9} {'AvgPeak':>9} {'EV/T':>7}")
+        for rname, rs in sorted(regime_stats.items()):
+            rw = rs["wins"]; rl = rs["losses"]; rt = rw + rl
+            if rt == 0: continue
+            rwr  = rw/rt*100
+            rpnl = rs["pnl"]
+            rpk  = rs.get("peak_sum", 0) / rw * 100 if rw > 0 else 0
+            rev  = rpnl / rt
+            flag = "✅" if rpnl > 0 else "🔴"
+            print(f"    {flag} {rname:<20} {rw:>4} {rl:>4} {rwr:>5.0f}% {rpnl:>+9.4f}U {rpk:>8.3f}% {rev:>+6.4f}U")
+
+    if trade_log:
+        print(f"    {'─'*60}")
+        print(f"    📋 Last 5:")
+        for t in trade_log[-5:]:
+            em = "🟢" if t["pnl"] > 0 else "🔴"
+            print(f"       {em} {t['sym']:<16} {t['side']} {t['pnl']:+.5f}U {t['hold']}s — {t['reason']}")
+    print(f"  {'─'*70}")
 
 def print_full():
     n    = _stats["wins"] + _stats["losses"]
@@ -931,14 +1035,14 @@ def print_full():
     peak_status  = f"✅ MARGIN +{peak_gap*100:.3f}%" if peak_gap >= 0 else f"❌ KURANG {abs(peak_gap)*100:.3f}%"
 
     print(f"\n  {'─'*70}")
-    print(f"    🔔 TRAIL v20.6 — TRAIL GAP TUNED (0.15%)")
+    print(f"    🔔 TRAIL v20.7 — EXHAUSTION FILTER TUNED")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"    📈 Exit: Trail:{_stats['trail_exit']} | SL:{_stats['hard_sl']} | EmgTP:{_stats['emg_tp']}")
     print(f"    🚫 Regime diblokir: {_stats['regime_block']} scan (RANGE+VOLATILE)")
     print(f"    💰 Avg Win:{aw:+.5f}U | Avg Loss:{-al:+.5f}U | BEP WR:{bep:.1f}%")
     print(f"    📊 Global WR:{learning.get_global_winrate():.1%}")
-    print(f"    ⚙️  SL:{SL_PCT*100:.2f}% | Trail aktif@{TRAIL_ACTIVATE_PCT*100:.2f}% gap:{TRAIL_GAP_PCT*100:.2f}%")
+    print(f"    ⚙️  SL:{SL_PCT*100:.2f}% | Trail@{TRAIL_ACTIVATE_PCT*100:.2f}% gap:{TRAIL_GAP_PCT*100:.2f}% | MinScore TREND:{MIN_SCORE} EXHAUST:{MIN_SCORE_EXHAUSTION}")
     print(f"    📏 Avg Peak(wins):{avg_pk_win*100:.3f}% | Butuh:{needed_peak*100:.3f}% | {peak_status}")
 
     # ── Per-regime breakdown ──────────────────────────────────────────────
@@ -1038,11 +1142,10 @@ def t_macro():
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  🔔 TRAIL v20.6 — TRAIL GAP TUNED (0.15%)                          ║")
-    print(f"║  ✅ SL:{SL_PCT*100:.2f}% | Trail aktif@{TRAIL_ACTIVATE_PCT*100:.2f}% | Gap:{TRAIL_GAP_PCT*100:.2f}% (turun dari 0.20%)      ║")
-    print("║  ✅ RANGE + VOLATILE diblokir | Hanya TRENDING + EXHAUSTION        ║")
-    print("║  ✅ Data aktual v20.5: butuh peak 0.692% → sekarang butuh 0.642%   ║")
-    print("║  ✅ Margin positif selama avg_peak(wins) > 0.642%                  ║")
+    print("║  🔔 TRAIL v20.8 — PEAK PnL PROTECTION                              ║")
+    print(f"║  ✅ SL:{SL_PCT*100:.2f}% | Trail@{TRAIL_ACTIVATE_PCT*100:.2f}% gap:{TRAIL_GAP_PCT*100:.2f}% | MinScore TREND:{MIN_SCORE} EXHAUST:{MIN_SCORE_EXHAUSTION}      ║")
+    print(f"║  🛡️  Peak DD: pause jika turun {PEAK_DRAWDOWN_LIMIT:.0f}U dari peak ({PEAK_DRAWDOWN_PAUSE//60}min)               ║")
+    print("║  ✅ RANGE+VOLATILE diblokir | EXHAUSTION+TRENDING tetap aktif      ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     try:
         valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
